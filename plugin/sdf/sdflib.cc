@@ -19,6 +19,7 @@
 
 #include <SdfLib/utils/Mesh.h>
 #include <SdfLib/OctreeSdf.h>
+#include <SdfLib/ExactOctreeSdf.h>
 #include <mujoco/mjplugin.h>
 #include <mujoco/mujoco.h>
 #include "sdf.h"
@@ -71,35 +72,53 @@ std::optional<SdfLib> SdfLib::Create(const mjModel* m, mjData* d,
       break;
     }
   }
-  int meshid = m->geom_dataid[geomid];
-  int nvert = m->mesh_vertnum[meshid];
-  int nface = m->mesh_facenum[meshid];
-  int* indices = m->mesh_face + 3*m->mesh_faceadr[meshid];
-  float* verts = m->mesh_vert + 3*m->mesh_vertadr[meshid];
-  std::vector<glm::vec3> vertices(nvert);
-  for (int i = 0; i < nvert; i++) {
-    mjtNum vert[3] = {verts[3*i+0], verts[3*i+1], verts[3*i+2]};
-    mju_rotVecQuat(vert, vert, m->mesh_quat + 4*meshid);
-    mju_addTo3(vert, m->mesh_pos + 3*meshid);
-    vertices[i].x = vert[0];
-    vertices[i].y = vert[1];
-    vertices[i].z = vert[2];
+
+  char const* sdf_bin = mj_getPluginConfig(m, instance, "precomputed_sdf");
+  std::string exact_arg = mj_getPluginConfig(m, instance, "exact_octree");
+  bool sdf_exact = "true" == exact_arg;
+  // char const* aabb = mj_getPluginConfig(m, instance, "aabb");
+
+  if (sdf_bin == nullptr || sdf_bin[0] == '\0') {
+    int meshid = m->geom_dataid[geomid];
+    int nvert = m->mesh_vertnum[meshid];
+    int nface = m->mesh_facenum[meshid];
+    int* indices = m->mesh_face + 3*m->mesh_faceadr[meshid];
+    float* verts = m->mesh_vert + 3*m->mesh_vertadr[meshid];
+    std::vector<glm::vec3> vertices(nvert);
+    for (int i = 0; i < nvert; i++) {
+      mjtNum vert[3] = {verts[3*i+0], verts[3*i+1], verts[3*i+2]};
+      mju_rotVecQuat(vert, vert, m->mesh_quat + 4*meshid);
+      mju_addTo3(vert, m->mesh_pos + 3*meshid);
+      vertices[i].x = vert[0];
+      vertices[i].y = vert[1];
+      vertices[i].z = vert[2];
+    }
+    sdflib::Mesh mesh(vertices.data(), nvert,
+                      MakeNonConstUnsigned(indices), 3*nface);
+    mesh.computeBoundingBox();
+    return SdfLib(std::move(mesh), sdf_exact);
+  } else {
+    return SdfLib(sdf_bin);
   }
-  sdflib::Mesh mesh(vertices.data(), nvert,
-                    MakeNonConstUnsigned(indices), 3*nface);
-  mesh.computeBoundingBox();
-  return SdfLib(std::move(mesh));
 }
 
-// plugin constructor
-SdfLib::SdfLib(sdflib::Mesh&& mesh) {
+// plugin constructor with SDF file
+SdfLib::SdfLib(const char* sdf_bin) {
+  sdf_func_ = sdflib::SdfFunction::loadFromFile(sdf_bin);
+}
+
+// plugin constructor with mesh
+SdfLib::SdfLib(sdflib::Mesh&& mesh, bool exact_octree) {
   sdflib::BoundingBox box = mesh.getBoundingBox();
   const glm::vec3 modelBBsize = box.getSize();
   box.addMargin(
       0.1f * glm::max(glm::max(modelBBsize.x, modelBBsize.y), modelBBsize.z));
-  sdf_func_ =
-      sdflib::OctreeSdf(mesh, box, 8, 3, 1e-3,
-                        sdflib::OctreeSdf::InitAlgorithm::CONTINUITY, 1);
+  if (exact_octree) {
+    sdf_func_ = std::make_unique<sdflib::ExactOctreeSdf>(mesh, box, 8, 3, 128, 1);
+  } else {
+    sdf_func_ = std::make_unique<sdflib::OctreeSdf>(mesh, box, 8, 3, 1e-3,
+                                            sdflib::OctreeSdf::InitAlgorithm::CONTINUITY, 1);
+  }
 }
 
 // plugin computation
@@ -121,8 +140,14 @@ void SdfLib::Visualize(const mjModel* m, mjData* d, const mjvOption* opt,
 // sdf
 mjtNum SdfLib::Distance(const mjtNum p[3]) const {
   glm::vec3 point(p[0], p[1], p[2]);
-  mjtNum boxDist = boxProjection(point, sdf_func_.getGridBoundingBox());
-  return sdf_func_.getDistance(point) + (boxDist <= 0 ? 0 : boxDist);
+  const sdflib::BoundingBox *bbox;
+  if (sdf_func_->getFormat() == sdflib::SdfFunction::SdfFormat::OCTREE) {
+    bbox = &dynamic_cast<const sdflib::OctreeSdf*>(sdf_func_.get())->getGridBoundingBox();
+  } else {
+    bbox = &dynamic_cast<const sdflib::ExactOctreeSdf*>(sdf_func_.get())->getGridBoundingBox();
+  }
+  mjtNum boxDist = boxProjection(point, *bbox);
+  return sdf_func_->getDistance(point) + (boxDist <= 0 ? 0 : boxDist);
 }
 
 // gradient of sdf
@@ -130,9 +155,15 @@ void SdfLib::Gradient(mjtNum grad[3], const mjtNum point[3]) const {
   glm::vec3 gradient;
   glm::vec3 p(point[0], point[1], point[2]);
 
+  const sdflib::BoundingBox *bbox;
+  if (sdf_func_->getFormat() == sdflib::SdfFunction::SdfFormat::OCTREE) {
+    bbox = &dynamic_cast<const sdflib::OctreeSdf*>(sdf_func_.get())->getGridBoundingBox();
+  } else {
+    bbox = &dynamic_cast<const sdflib::ExactOctreeSdf*>(sdf_func_.get())->getGridBoundingBox();
+  }
   // analytic in the interior
-  if (boxProjection(p, sdf_func_.getGridBoundingBox()) <= 0) {
-    sdf_func_.getDistance(p, gradient);
+  if (boxProjection(p, *bbox) <= 0) {
+    sdf_func_->getDistance(p, gradient);
     grad[0] = gradient[0];
     grad[1] = gradient[1];
     grad[2] = gradient[2];
@@ -162,7 +193,7 @@ void SdfLib::RegisterPlugin() {
   plugin.name = "mujoco.sdf.sdflib";
   plugin.capabilityflags |= mjPLUGIN_SDF;
 
-  const char* attributes[] = {"aabb"};
+  const char* attributes[] = {"aabb", "precomputed_sdf", "exact_octree"};
   plugin.nattribute = sizeof(attributes) / sizeof(attributes[0]);
   plugin.attributes = attributes;
   plugin.nstate = +[](const mjModel* m, int instance) { return 0; };

@@ -18,7 +18,7 @@
 #include <optional>
 
 #include <SdfLib/utils/Mesh.h>
-#include <SdfLib/OctreeSdf.h>
+#include <SdfLib/SdfFunction.h>
 #include <mujoco/mjdata.h>
 #include <mujoco/mjmodel.h>
 #include <mujoco/mjtnum.h>
@@ -44,9 +44,10 @@ class SdfLib {
   static void RegisterPlugin();
 
  private:
-  SdfLib(sdflib::Mesh&& mesh);
+  SdfLib(const char* sdf_filepath);
+  SdfLib(sdflib::Mesh&& mesh, bool exact_octree);
   SdfVisualizer visualizer_;
-  sdflib::OctreeSdf sdf_func_;
+  std::unique_ptr<sdflib::SdfFunction> sdf_func_;
 };
 
 }  // namespace mujoco::plugin::sdf
