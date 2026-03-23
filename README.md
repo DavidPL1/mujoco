@@ -1,3 +1,10 @@
+<h2>This forked branch is maintained solely for archival/reference purposes in connection with my dissertation.
+The hydroelastic solver integration implemented here was originally developed by Florian Patzelt.
+This fork preserves the referenced code state for reproducibility; it does not claim original authorship of the solver modifications.</h2>
+
+</br>
+</br>
+
 <h1>
   <a href="#"><img alt="MuJoCo" src="banner.png" width="100%"/></a>
 </h1>
